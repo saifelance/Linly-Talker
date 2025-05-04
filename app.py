@@ -1,11 +1,20 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+import os
+
 import random 
+import shlex
+import socket
 import gradio as gr
 from zhconv import convert
 from LLM import LLM
 from ASR import WhisperASR
 from TFG import SadTalker 
 from TTS import EdgeTTS
+import subprocess
+from datetime import timedelta
+
 from src.cost_time import calculate_time
 
 from configs import *
@@ -45,6 +54,10 @@ ref_video = None
 ref_info = 'pose'
 use_idle_mode = False
 length_of_audio = 5
+ssl_certfile = "./certs/localhost+2.pem"
+ssl_keyfile = "./certs/localhost+2-key.pem"
+
+
 
 @calculate_time
 def Asr(audio):
@@ -57,53 +70,125 @@ def Asr(audio):
         gr.Warning(question)
     return question
 
+
+def generate_simple_vtt(text: str, output_path: str = "answer.vtt"):
+    lines = text.split('. ')
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+        for idx, sentence in enumerate(lines):
+            start = str(timedelta(seconds=idx * 2))  # 2s per line estimate
+            end = str(timedelta(seconds=(idx + 1) * 2))
+            f.write(f"{idx + 1}\n{start} --> {end}\n{sentence.strip()}\n\n")
+
+
+
 @calculate_time
-def TTS_response(text, 
-                 voice, rate, volume, pitch,):
+def TTS_response(text, voice, rate, volume, pitch):
+    import shlex
+    import time
+
+    # Clear old files
+    if os.path.exists("answer.wav"):
+        os.remove("answer.wav")
+    if os.path.exists("answer.vtt"):
+        os.remove("answer.vtt")
+
     try:
-        tts.predict(text, voice, rate, volume, pitch , 'answer.wav', 'answer.vtt')
-    except:
-        os.system(f'edge-tts --text "{text}" --voice {voice} --write-media answer.wav --write-subtitles answer.vtt')
+        print("🔹 Calling native tts.predict...")
+        tts.predict(text, voice, rate, volume, pitch, 'answer.wav', 'answer.vtt')
+        print("🔹 Native tts.predict completed")
+    except Exception as e:
+        print("❌ Native tts.predict() failed:", e)
+
+    # Print file statuses before deciding fallback
+    print("🔍 answer.wav exists?", os.path.exists("answer.wav"))
+    print("🔍 answer.vtt exists?", os.path.exists("answer.vtt"))
+
+    # Force fallback if subtitle didn't generate
+    if not os.path.exists("answer.vtt"):
+        print("⚠️ answer.vtt not found. Falling back to CLI...")
+        try:
+            safe_text = text.replace('"', "'")
+            cwd = os.getcwd()
+            wav_path = os.path.join(cwd, "answer.wav")
+            vtt_path = os.path.join(cwd, "answer.vtt")
+
+            command = f'edge-tts --text "{safe_text}" --voice {voice} --write-media "{wav_path}" --write-subtitles "{vtt_path}"'
+            print("🔹 Running fallback command:", command)
+            result = subprocess.run(shlex.split(command), capture_output=True, text=True)
+
+            print("📤 CLI STDOUT:", result.stdout)
+            print("📥 CLI STDERR:", result.stderr)
+
+            if result.returncode != 0:
+                raise RuntimeError(f"CLI failed with return code {result.returncode}")
+
+        except Exception as cli_err:
+            raise RuntimeError(f"Fallback edge-tts CLI failed: {cli_err}")
+
+    # Final check
+    if not os.path.exists("answer.wav"):
+        raise RuntimeError("❌ Failed to generate audio file: answer.wav")
+    if not os.path.exists("answer.vtt"):
+        raise RuntimeError("❌ Failed to generate subtitle file: answer.vtt")
+
     return 'answer.wav', 'answer.vtt'
+
+
 
 @calculate_time
 def LLM_response(question, voice = 'zh-CN-XiaoxiaoNeural', rate = 0, volume = 0, pitch = 0):
     answer = llm.generate(question)
     print(answer)
-    answer_audio, answer_vtt, _ = TTS_response(answer, voice, rate, volume, pitch)
+    answer_audio, answer_vtt = TTS_response(answer, voice, rate, volume, pitch)  # ✅ fixed
     return answer_audio, answer_vtt, answer
 
+
 @calculate_time
-def Talker_response(text, voice = 'zh-CN-XiaoxiaoNeural', rate = 0, volume = 100, pitch = 0, batch_size = 2):
-    voice = 'zh-CN-XiaoxiaoNeural' if voice not in tts.SUPPORTED_VOICE else voice
-    # print(voice , rate , volume , pitch)
+def Talker_response(text, voice='zh-CN-XiaoxiaoNeural', rate=0, volume=100, pitch=0, batch_size=2):
+    voice = voice if voice in tts.SUPPORTED_VOICE else 'zh-CN-XiaoxiaoNeural'
+
+    # Generate audio and subtitles
     driven_audio, driven_vtt, _ = LLM_response(text, voice, rate, volume, pitch)
+
+    # Validate audio and subtitle files
+    if not os.path.exists(driven_audio):
+        raise RuntimeError(f"Audio not saved: {driven_audio}")
+    if driven_vtt and not os.path.exists(driven_vtt):
+        raise RuntimeError(f"Subtitle file not saved: {driven_vtt}")
+
+    # Generate video
     pose_style = random.randint(0, 45)
-    video = talker.test(pic_path,
-                        crop_pic_path,
-                        first_coeff_path,
-                        crop_info,
-                        source_image,
-                        driven_audio,
-                        preprocess_type,
-                        is_still_mode,
-                        enhancer,
-                        batch_size,                            
-                        size_of_image,
-                        pose_style,
-                        facerender,
-                        exp_weight,
-                        use_ref_video,
-                        ref_video,
-                        ref_info,
-                        use_idle_mode,
-                        length_of_audio,
-                        blink_every,
-                        fps=20)
-    if driven_vtt:
-        return video, driven_vtt
-    else:
-        return video
+    video = talker.test(
+        pic_path,
+        crop_pic_path,
+        first_coeff_path,
+        crop_info,
+        source_image,
+        driven_audio,
+        preprocess_type,
+        is_still_mode,
+        enhancer,
+        batch_size,
+        size_of_image,
+        pose_style,
+        facerender,
+        exp_weight,
+        use_ref_video,
+        ref_video,
+        ref_info,
+        use_idle_mode,
+        length_of_audio,
+        blink_every,
+        fps=20
+    )
+
+    # Validate video file
+    if not os.path.exists(video):
+        raise RuntimeError(f"Video not generated: {video}")
+
+    return (video, driven_vtt) if driven_vtt else video
+
 
 def main():
     with gr.Blocks(analytics_enabled=False, title = 'Linly-Talker') as inference:
@@ -143,10 +228,13 @@ def main():
                                                     label='Talker Batch size')
                             asr_text = gr.Button('语音识别（语音对话后点击）')
                             asr_text.click(fn=Asr,inputs=[question_audio],outputs=[input_text])
+                            audio_preview = gr.Audio(label="播放识别的语音", interactive=False)
+                            asr_text.click(fn=Asr, inputs=[question_audio], outputs=[input_text])
+
                             
                         # with gr.Column(variant='panel'):
-                        #     input_text = gr.Textbox(label="Input Text", lines=3)
-                        #     text_button = gr.Button("文字对话", variant='primary')
+                        # input_text = gr.Textbox(label="Input Text", lines=3)
+                        # text_button = gr.Button("文字对话", variant='primary')
                         
                 
             with gr.Column(variant='panel'): 
@@ -178,22 +266,41 @@ def main():
 
 
     
+def get_free_port(preferred_port=7860):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('', preferred_port))
+            return preferred_port
+        except OSError:
+            s.bind(('', 0))
+            return s.getsockname()[1]
+
 if __name__ == "__main__":
-    # llm = LLM(mode='offline').init_model('Linly', 'Linly-AI/Chinese-LLaMA-2-7B-hf')
-    # llm = LLM(mode='offline').init_model('Gemini', 'gemini-pro', api_key = "your api key")
-    # llm = LLM(mode='offline').init_model('Qwen', 'Qwen/Qwen-1_8B-Chat')
-    llm = LLM(mode='offline').init_model('Qwen', 'Qwen/Qwen-1_8B-Chat')
-    talker = SadTalker(lazy_load=True)
+    llm = LLM(mode='offline').init_model('Linly', 'MBZUAI/LaMini-Flan-T5-783M')
     asr = WhisperASR('base')
     tts = EdgeTTS()
+
+    try:
+        talker = SadTalker(lazy_load=True)
+    except Exception as e:
+        print("❌ SadTalker could not be initialized:", e)
+        talker = None
+
     gr.close_all()
     demo = main()
     demo.queue()
-    # demo.launch()
-    demo.launch(server_name=ip, # 本地端口localhost:127.0.0.1 全局端口转发:"0.0.0.0"
-                server_port=port,
-                # 似乎在Gradio4.0以上版本可以不使用证书也可以进行麦克风对话
-                ssl_certfile=ssl_certfile,
-                ssl_keyfile=ssl_keyfile,
-                ssl_verify=False,
-                debug=True)
+
+    port = get_free_port(7860)
+
+    cert_exists = os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile)
+
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=port,
+        ssl_certfile=ssl_certfile if cert_exists else None,
+        ssl_keyfile=ssl_keyfile if cert_exists else None,
+        ssl_verify=False,
+        debug=True
+    )
+
+

@@ -3,6 +3,11 @@ sys.path.append('./')
 
 import torch, uuid
 import os, sys, shutil, platform
+
+import torch
+torch.backends.mps.enabled = False  # 🔒 Disable MPS on macOS
+
+
 # from src.facerender.pirender_animate import AnimateFromCoeff_PIRender
 from src.utils.preprocess import CropAndExtract
 from src.test_audio2coeff import Audio2Coeff  
@@ -19,13 +24,7 @@ from src.utils.init_path import init_path
 class SadTalker():
 
     def __init__(self, checkpoint_path='checkpoints', config_path='src/config', lazy_load=False):
-        import platform
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif platform.system() == 'Darwin': # macos 
-            device = "mps"
-        else:
-            device = "cpu"
+        device = "cpu"  # ✅ Force CPU regardless of OS or GPU availability
         
         self.device = device
 
